@@ -17,5 +17,7 @@ func (c *CNIManager) SetCNIPlugin(plugin ocicni.CNIPlugin) error {
 		}
 	}
 	c.plugin = plugin
+	// initialize the poll, but don't run it continuously (or else the mocks will get weird)
+	c.pollFunc()
 	return nil
 }
