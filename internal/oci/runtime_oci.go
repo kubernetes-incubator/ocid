@@ -346,9 +346,15 @@ func (r *runtimeOCI) ExecSyncContainer(ctx context.Context, c *Container, comman
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
+	errorCh := WatchForFile(ctx, pidFile, []notify.Event{notify.InModify, notify.InMovedTo})
+
 	err = cmd.Start()
 	if err != nil {
 		return nil, err
+	}
+
+	if err := <-errorCh; err != nil {
+		return nil, errors.Wrapf(err, "exec sync for container %s", c.ID())
 	}
 
 	// wait till the command is done
@@ -1068,8 +1074,6 @@ func WatchForFile(ctx context.Context, path string, opsToWatch []notify.Event) c
 	go func() {
 		defer notify.Stop(c)
 		for ei := range c {
-			fmt.Println(ei)
-			externalErrorCh <- nil
 			if ei.Path() == path {
 				externalErrorCh <- nil
 				return
