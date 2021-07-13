@@ -13,10 +13,10 @@ import (
 	"time"
 
 	libconfig "github.com/cri-o/cri-o/pkg/config"
-	"github.com/fsnotify/fsnotify"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/rjeczalik/notify"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/util/cert"
 )
@@ -477,42 +477,31 @@ func newCertReloader(doneChan chan struct{}, certPath, keyPath string) (*certRel
 		return nil, errors.Wrap(err, "load certificate")
 	}
 
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return nil, errors.Wrap(err, "create new watcher")
+	eventChan := make(chan notify.EventInfo, 1)
+
+	for _, f := range []string{certPath, keyPath} {
+		logrus.Debugf("Watching file %s for changes", f)
+		if err := notify.Watch(f, eventChan, notify.All); err != nil {
+			logrus.Fatalf("Unable to watch %s: %v", f, err)
+		}
 	}
 	go func() {
-		defer watcher.Close()
-		done := make(chan struct{})
-		go func() {
-			for {
-				select {
-				case event := <-watcher.Events:
-					logrus.Debugf(
-						"Got cert watcher event for %s (%s), reloading certificates",
-						event.Name, event.Op.String(),
-					)
-					if err := reloader.reload(); err != nil {
-						logrus.Warnf("Keeping previous certificates: %v", err)
-					}
-				case err := <-watcher.Errors:
-					logrus.Errorf("Cert watcher error: %v", err)
-					close(done)
-					return
-				case <-doneChan:
-					logrus.Debug("Closing cert watcher")
-					close(done)
-					return
+		defer notify.Stop(eventChan)
+		for {
+			select {
+			case eventInfo := <-eventChan:
+				logrus.Debugf(
+					"Got cert watcher event for %s (%s), reloading certificates",
+					eventInfo.Path(), eventInfo.Event().String(),
+				)
+				if err := reloader.reload(); err != nil {
+					logrus.Warnf("Keeping previous certificates: %v", err)
 				}
-			}
-		}()
-		for _, f := range []string{certPath, keyPath} {
-			logrus.Debugf("Watching file %s for changes", f)
-			if err := watcher.Add(f); err != nil {
-				logrus.Fatalf("Unable to watch %s: %v", f, err)
+			case <-doneChan:
+				logrus.Debug("Closing cert watcher")
+				return
 			}
 		}
-		<-done
 	}()
 
 	return reloader, nil

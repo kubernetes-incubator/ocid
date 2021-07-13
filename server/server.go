@@ -33,8 +33,8 @@ import (
 	"github.com/cri-o/cri-o/server/metrics"
 	"github.com/cri-o/cri-o/server/streaming"
 	"github.com/cri-o/cri-o/utils"
-	"github.com/fsnotify/fsnotify"
 	"github.com/pkg/errors"
+	"github.com/rjeczalik/notify"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -621,62 +621,49 @@ func (s *Server) MonitorsCloseChan() chan struct{} {
 // StartExitMonitor start a routine that monitors container exits
 // and updates the container status
 func (s *Server) StartExitMonitor(ctx context.Context) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
+	eventChan := make(chan notify.EventInfo, 1)
+
+	if err := notify.Watch(s.config.ContainerExitsDir, eventChan, notify.Create); err != nil {
 		log.Fatalf(ctx, "Failed to create new watch: %v", err)
 	}
-	defer watcher.Close()
-
-	done := make(chan struct{})
 	go func() {
+		defer notify.Stop(eventChan)
 		for {
 			select {
-			case event := <-watcher.Events:
-				log.Debugf(ctx, "Event: %v", event)
-				if event.Op&fsnotify.Create == fsnotify.Create {
-					containerID := filepath.Base(event.Name)
-					log.Debugf(ctx, "Container or sandbox exited: %v", containerID)
-					c := s.GetContainer(containerID)
-					if c != nil {
-						log.Debugf(ctx, "Container exited and found: %v", containerID)
+			case ei := <-eventChan:
+				log.Debugf(ctx, "Event: %v", ei)
+				containerID := filepath.Base(ei.Path())
+				log.Debugf(ctx, "Container or sandbox exited: %v", containerID)
+				c := s.GetContainer(containerID)
+				if c != nil {
+					log.Debugf(ctx, "Container exited and found: %v", containerID)
+					err := s.Runtime().UpdateContainerStatus(ctx, c)
+					if err != nil {
+						log.Warnf(ctx, "Failed to update container status %s: %v", containerID, err)
+					} else if err := s.ContainerStateToDisk(ctx, c); err != nil {
+						log.Warnf(ctx, "Unable to write containers %s state to disk: %v", c.ID(), err)
+					}
+				} else {
+					sb := s.GetSandbox(containerID)
+					if sb != nil {
+						c := sb.InfraContainer()
+						if c == nil {
+							log.Warnf(ctx, "No infra container set for sandbox: %v", containerID)
+							continue
+						}
+						log.Debugf(ctx, "Sandbox exited and found: %v", containerID)
 						err := s.Runtime().UpdateContainerStatus(ctx, c)
 						if err != nil {
-							log.Warnf(ctx, "Failed to update container status %s: %v", containerID, err)
+							log.Warnf(ctx, "Failed to update sandbox infra container status %s: %v", c.ID(), err)
 						} else if err := s.ContainerStateToDisk(ctx, c); err != nil {
 							log.Warnf(ctx, "Unable to write containers %s state to disk: %v", c.ID(), err)
 						}
-					} else {
-						sb := s.GetSandbox(containerID)
-						if sb != nil {
-							c := sb.InfraContainer()
-							if c == nil {
-								log.Warnf(ctx, "No infra container set for sandbox: %v", containerID)
-								continue
-							}
-							log.Debugf(ctx, "Sandbox exited and found: %v", containerID)
-							err := s.Runtime().UpdateContainerStatus(ctx, c)
-							if err != nil {
-								log.Warnf(ctx, "Failed to update sandbox infra container status %s: %v", c.ID(), err)
-							} else if err := s.ContainerStateToDisk(ctx, c); err != nil {
-								log.Warnf(ctx, "Unable to write containers %s state to disk: %v", c.ID(), err)
-							}
-						}
 					}
 				}
-			case err := <-watcher.Errors:
-				log.Debugf(ctx, "Watch error: %v", err)
-				close(done)
-				return
 			case <-s.monitorsChan:
 				log.Debugf(ctx, "Closing exit monitor...")
-				close(done)
 				return
 			}
 		}
 	}()
-	if err := watcher.Add(s.config.ContainerExitsDir); err != nil {
-		log.Errorf(ctx, "Watcher.Add(%q) failed: %s", s.config.ContainerExitsDir, err)
-		close(done)
-	}
-	<-done
 }
